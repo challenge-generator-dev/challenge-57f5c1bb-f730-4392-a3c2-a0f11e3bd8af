@@ -1,0 +1,480 @@
+openapi: 3.1.0
+info:
+  title: Core Financiero Multi-Región API
+  description: |
+    API del Core Financiero Multi-Región que soporta operaciones financieras con alta disponibilidad
+    y consistencia eventual entre regiones. Implementa patrones como CQRS, Sagas y Event Sourcing
+    para garantizar resiliencia en escenarios de fallo regional.
+
+    **Requisitos Arquitectónicos Significativos (ASRs):**
+    - Disponibilidad: 99.99% mensual (SLA), con caída máxima de 1 región completa sin impacto en el servicio.
+    - Latencia: p99 < 80ms para transacciones dentro de la región primaria del cliente.
+    - Consistencia: Consistencia eventual con RPO < 5s y RTO < 2min para operaciones críticas.
+    - Escalabilidad: Soportar 50,000 TPS con crecimiento del 20% anual sin cambios arquitectónicos.
+    - Seguridad: Cumplimiento con PCI-DSS, SOC2 e ISO 27001 para todas las operaciones.
+
+    **Patrones Implementados:**
+    1. **Multi-Region Active-Active:** Réplicas activas en múltiples regiones con balanceo de carga regional.
+    2. **CQRS:** Separación de modelos de lectura y escritura para optimizar rendimiento y escalabilidad.
+    3. **Sagas:** Coordinación de transacciones distribuidas con compensación automática.
+    4. **Event Sourcing:** Registro inmutable de todas las operaciones para auditoría y replay.
+    5. **Circuit Breaker:** Protección contra fallos en cascada en dependencias externas.
+    6. **Retry con Backoff Exponencial:** Reintentos inteligentes para operaciones transitorias.
+    7. **Bulkhead:** Aislamiento de recursos para evitar contención.
+    8. **Rate Limiting:** Control de tráfico para proteger contra abusos y picos de carga.
+  version: 1.0.0
+  contact:
+    name: Equipo de Arquitectura Financiera
+    email: architecture@financialglobal.com
+  license:
+    name: Propietario - Confidencial
+    url: https://internal.financialglobal.com/license
+
+servers:
+  - url: https://core-financiero-{region}.financialglobal.com/api/v1
+    description: Servidor regionalizado del Core Financiero
+    variables:
+      region:
+        enum:
+          - us-east-1
+          - eu-west-1
+          - ap-southeast-1
+          - sa-east-1
+        default: us-east-1
+        description: |
+          Región AWS donde se despliega la instancia del Core Financiero.
+          Cada región opera en modo Active-Active con réplicas de datos.
+
+          **Requisitos de Consistencia:**
+          - Las operaciones de escritura se replican asíncronamente entre regiones con un RPO < 5s.
+          - Las operaciones de lectura pueden retornar datos ligeramente desactualizados (stale reads)
+            dentro de la misma región con un staleness máximo de 30s.
+
+          **Latencia Esperada:**
+          | Región Origen | Región Destino | Latencia p99 (ms) |
+          |---------------|----------------|-------------------|
+          | us-east-1     | eu-west-1      | 120               |
+          | us-east-1     | ap-southeast-1 | 180               |
+          | eu-west-1     | ap-southeast-1 | 150               |
+
+  - url: https://core-financiero-global.financialglobal.com/api/v1
+    description: |
+      Endpoint global para operaciones que requieren consistencia fuerte entre regiones.
+      Utilizado únicamente para casos de uso que no pueden tolerar consistencia eventual
+      (ej: consultas de saldo consolidado para clientes corporativos).
+
+      **Limitaciones:**
+      - Latencia p99 < 300ms para operaciones globales.
+      - Throughput máximo de 1,000 TPS para evitar saturación de la red inter-región.
+      - No disponible durante fallos de red entre regiones (circuit breaker activado).
+
+paths:
+  /accounts:
+    post:
+      tags:
+        - Account Management
+      summary: Crear una nueva cuenta financiera
+      description: |
+        Crea una nueva cuenta en el Core Financiero. La operación se procesa como una Saga
+        distribuida para garantizar consistencia en todas las regiones.
+
+        **Flujo de la Saga:**
+        1. **Crear Cuenta Local:** Se crea la cuenta en la región primaria del cliente.
+        2. **Replicar Datos:** Los datos de la cuenta se replican asíncronamente a las otras regiones.
+        3. **Notificar Sistemas Externos:** Se envían eventos a sistemas de auditoría y fraude.
+        4. **Confirmar Operación:** La operación se confirma solo después de que todas las regiones
+           hayan recibido los datos (con consistencia eventual).
+
+        **Escenarios de Fallo:**
+        - Si una región está caída, la cuenta se crea localmente y se sincroniza cuando la región se recupere.
+        - Si la replicación falla, se reintenta con backoff exponencial (máximo 5 intentos).
+        - Si la notificación a sistemas externos falla, se envía a una cola de dead letter para reprocesamiento.
+
+        **Preguntas para completar la definición:**
+        1. ¿Qué información mínima requiere el request para crear una cuenta? ¿Cómo garantizas la validación de datos en todas las regiones?
+        2. ¿Qué headers deben incluirse para identificar la región primaria del cliente y el contexto de la transacción?
+        3. ¿Cómo manejarías la idempotencia para evitar duplicados en casos de reintentos?
+        4. ¿Qué códigos de respuesta específicos devolverías para los escenarios de fallo descritos?
+        5. ¿Cómo integrarías este endpoint con el patrón CQRS para separar las operaciones de escritura y lectura?
+      operationId: createAccount
+      requestBody:
+        description: Detalles de la cuenta a crear
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountCreationRequest'
+      responses:
+        '201':
+          description: Cuenta creada exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountCreationResponse'
+        '400':
+          description: Solicitud inválida (ej: datos faltantes o inválidos)
+        '409':
+          description: Conflicto (ej: la cuenta ya existe)
+        '503':
+          description: Servicio no disponible (ej: fallo en la replicación entre regiones)
+        default:
+          description: Error inesperado
+
+  /accounts/{accountId}/transactions:
+    post:
+      tags:
+        - Transaction Processing
+      summary: Procesar una transacción financiera
+      description: |
+        Procesa una transacción financiera (ej: transferencia, pago, retiro) con garantías
+        de resiliencia multi-región. La operación sigue el patrón Sagas para coordinar
+        los pasos distribuidos.
+
+        **Flujo de la Saga:**
+        1. **Validar Transacción:** Verifica que la cuenta origen tenga fondos suficientes.
+        2. **Reservar Fondos:** Bloquea los fondos en la cuenta origen.
+        3. **Procesar Transacción:** Debita la cuenta origen y acredita la cuenta destino.
+        4. **Replicar Cambios:** Replica los cambios a todas las regiones.
+        5. **Notificar Sistemas Externos:** Envía eventos a auditoría, fraude y sistemas de notificación.
+        6. **Confirmar Transacción:** Libera los fondos reservados y confirma la operación.
+
+        **Tácticas de Resiliencia:**
+        - **Circuit Breaker:** Protege contra fallos en dependencias externas (ej: SWIFT).
+        - **Retry con Backoff Exponencial:** Reintenta operaciones transitorias (máximo 3 intentos).
+        - **Bulkhead:** Aísla las operaciones de procesamiento de transacciones para evitar contención.
+        - **Compensación:** Revierte la transacción si algún paso de la Saga falla.
+
+        **Preguntas para completar la definición:**
+        1. ¿Qué información debe incluirse en el request para procesar una transacción? ¿Cómo garantizas la atomicidad en un entorno multi-región?
+        2. ¿Cómo manejarías la idempotencia para evitar duplicados en casos de reintentos?
+        3. ¿Qué estrategias de compensación implementarías si la replicación a una región falla?
+        4. ¿Cómo integrarías este endpoint con Event Sourcing para registrar todas las operaciones?
+        5. ¿Qué métricas expondrías para monitorear el rendimiento y la salud de las Sagas?
+      operationId: processTransaction
+      parameters:
+        - name: accountId
+          in: path
+          description: Identificador de la cuenta origen
+          required: true
+          schema:
+            type: string
+            format: uuid
+            example: "123e4567-e89b-12d3-a456-426614174000"
+        - name: X-Region-Primary
+          in: header
+          description: Región primaria del cliente para esta transacción
+          required: true
+          schema:
+            type: string
+            enum: ["us-east-1", "eu-west-1", "ap-southeast-1", "sa-east-1"]
+      requestBody:
+        description: Detalles de la transacción a procesar
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionRequest'
+      responses:
+        '200':
+          description: Transacción procesada exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionResponse'
+        '400':
+          description: Solicitud inválida (ej: fondos insuficientes, datos inválidos)
+        '404':
+          description: Cuenta no encontrada
+        '429':
+          description: Límite de tasa excedido
+        '500':
+          description: Error interno del servidor (ej: fallo en la Saga)
+        '503':
+          description: Servicio no disponible (ej: fallo en la replicación entre regiones)
+
+  /accounts/{accountId}/balance:
+    get:
+      tags:
+        - Account Management
+      summary: Consultar el saldo de una cuenta
+      description: |
+        Consulta el saldo actual de una cuenta con consistencia eventual. Este endpoint
+        implementa el modelo de lectura del patrón CQRS para optimizar el rendimiento.
+
+        **Consistencia de Datos:**
+        - El saldo retornado puede estar ligeramente desactualizado (stale reads) dentro de la misma región,
+          con un staleness máximo de 30s.
+        - Para operaciones que requieren consistencia fuerte (ej: transacciones), se debe usar el endpoint
+          de transacciones en lugar de este endpoint.
+
+        **Tácticas de Resiliencia:**
+        - **Cache:** Los saldos se cachean con una TTL de 10s para reducir la carga en la base de datos.
+        - **Circuit Breaker:** Protege contra fallos en la base de datos.
+        - **Bulkhead:** Aísla las consultas de saldo para evitar afectar otras operaciones.
+
+        **Preguntas para completar la definición:**
+        1. ¿Qué headers deben incluirse para identificar la región del cliente y el nivel de consistencia requerido?
+        2. ¿Cómo manejarías las consultas desde regiones no primarias para minimizar la latencia?
+        3. ¿Qué estrategias de caché implementarías para garantizar que los saldos no estén muy desactualizados?
+        4. ¿Cómo integrarías este endpoint con el modelo de escritura de CQRS para garantizar consistencia eventual?
+        5. ¿Qué métricas expondrías para monitorear la frescura de los datos y el rendimiento de las consultas?
+      operationId: getAccountBalance
+      parameters:
+        - name: accountId
+          in: path
+          description: Identificador de la cuenta
+          required: true
+          schema:
+            type: string
+            format: uuid
+            example: "123e4567-e89b-12d3-a456-426614174000"
+        - name: X-Region-Primary
+          in: header
+          description: Región primaria del cliente para esta consulta
+          required: true
+          schema:
+            type: string
+            enum: ["us-east-1", "eu-west-1", "ap-southeast-1", "sa-east-1"]
+        - name: consistency
+          in: query
+          description: |
+            Nivel de consistencia requerido para la consulta:
+            - eventual: Retorna datos con consistencia eventual (staleness < 30s).
+            - strong: Retorna datos con consistencia fuerte (solo disponible en el endpoint global).
+          required: false
+          schema:
+            type: string
+            enum: ["eventual", "strong"]
+            default: "eventual"
+      responses:
+        '200':
+          description: Saldo consultado exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountBalanceResponse'
+        '404':
+          description: Cuenta no encontrada
+        '429':
+          description: Límite de tasa excedido
+        '503':
+          description: Servicio no disponible (ej: fallo en la base de datos)
+
+components:
+  schemas:
+    AccountCreationRequest:
+      type: object
+      description: |
+        Datos requeridos para crear una nueva cuenta financiera.
+        **Preguntas para completar el esquema:**
+        1. ¿Qué campos son obligatorios para cumplir con regulaciones como KYC (Know Your Customer)?
+        2. ¿Cómo estructurarías el objeto para soportar múltiples tipos de cuentas (retail, corporativa, etc.)?
+        3. ¿Qué validaciones aplicarías a nivel de esquema para garantizar la integridad de los datos?
+        4. ¿Cómo manejarías la información sensible (ej: PII) para cumplir con normativas como GDPR?
+      properties:
+        customerId:
+          type: string
+          format: uuid
+          description: Identificador único del cliente
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        accountType:
+          type: string
+          enum: ["SAVINGS", "CHECKING", "INVESTMENT", "LOAN"]
+          description: Tipo de cuenta
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: Código ISO de la moneda (ej: USD, EUR)
+          example: "USD"
+        initialBalance:
+          type: number
+          format: double
+          minimum: 0
+          description: Saldo inicial de la cuenta
+          example: 1000.00
+      required:
+        - customerId
+        - accountType
+        - currency
+
+    AccountCreationResponse:
+      type: object
+      description: |
+        Respuesta de la creación de una cuenta.
+        **Preguntas para completar el esquema:**
+        1. ¿Qué información adicional debería incluirse para soportar la trazabilidad y auditoría?
+        2. ¿Cómo manejarías los metadatos de la región donde se creó la cuenta?
+        3. ¿Qué campos incluirías para facilitar la integración con otros sistemas (ej: sistemas de fraude)?
+      properties:
+        accountId:
+          type: string
+          format: uuid
+          description: Identificador único de la cuenta creada
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        status:
+          type: string
+          enum: ["ACTIVE", "PENDING", "SUSPENDED"]
+          description: Estado inicial de la cuenta
+        createdAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de creación de la cuenta
+        region:
+          type: string
+          enum: ["us-east-1", "eu-west-1", "ap-southeast-1", "sa-east-1"]
+          description: Región donde se creó la cuenta
+      required:
+        - accountId
+        - status
+        - createdAt
+        - region
+
+    TransactionRequest:
+      type: object
+      description: |
+        Datos requeridos para procesar una transacción financiera.
+        **Preguntas para completar el esquema:**
+        1. ¿Qué campos son obligatorios para cumplir con regulaciones como AML (Anti-Money Laundering)?
+        2. ¿Cómo estructurarías el objeto para soportar múltiples tipos de transacciones (transferencia, pago, retiro)?
+        3. ¿Qué validaciones aplicarías para garantizar que la transacción es válida antes de procesarla?
+        4. ¿Cómo manejarías la información de referencia para idempotencia y trazabilidad?
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+          description: Identificador único de la transacción para idempotencia
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        type:
+          type: string
+          enum: ["TRANSFER", "DEPOSIT", "WITHDRAWAL", "PAYMENT"]
+          description: Tipo de transacción
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          description: Monto de la transacción
+          example: 150.75
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: Código ISO de la moneda
+          example: "USD"
+        destinationAccountId:
+          type: string
+          format: uuid
+          description: Identificador de la cuenta destino (requerido para transferencias)
+          example: "123e4567-e89b-12d3-a456-426614174001"
+        reference:
+          type: string
+          maxLength: 255
+          description: Referencia adicional para la transacción (ej: número de factura)
+      required:
+        - transactionId
+        - type
+        - amount
+        - currency
+
+    TransactionResponse:
+      type: object
+      description: |
+        Respuesta del procesamiento de una transacción.
+        **Preguntas para completar el esquema:**
+        1. ¿Qué información adicional debería incluirse para soportar la trazabilidad y auditoría?
+        2. ¿Cómo manejarías los metadatos de la región donde se procesó la transacción?
+        3. ¿Qué campos incluirías para indicar el estado de la Saga (ej: pasos completados, pasos pendientes)?
+        4. ¿Cómo representarías los errores o compensaciones en caso de fallo en algún paso de la Saga?
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+          description: Identificador único de la transacción
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        status:
+          type: string
+          enum: ["COMPLETED", "PENDING", "FAILED", "COMPENSATED"]
+          description: Estado final de la transacción
+        processedAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de procesamiento de la transacción
+        region:
+          type: string
+          enum: ["us-east-1", "eu-west-1", "ap-southeast-1", "sa-east-1"]
+          description: Región donde se procesó la transacción
+        sagaStatus:
+          type: object
+          description: Estado de los pasos de la Saga
+          properties:
+            stepsCompleted:
+              type: array
+              items:
+                type: string
+                enum: ["VALIDATE", "RESERVE_FUNDS", "PROCESS", "REPLICATE", "NOTIFY"]
+              description: Pasos de la Saga completados exitosamente
+            stepsPending:
+              type: array
+              items:
+                type: string
+                enum: ["VALIDATE", "RESERVE_FUNDS", "PROCESS", "REPLICATE", "NOTIFY"]
+              description: Pasos de la Saga pendientes
+            compensations:
+              type: array
+              items:
+                type: object
+                properties:
+                  step:
+                    type: string
+                    enum: ["VALIDATE", "RESERVE_FUNDS", "PROCESS", "REPLICATE", "NOTIFY"]
+                    description: Paso que requirió compensación
+                  action:
+                    type: string
+                    description: Acción de compensación realizada
+                  timestamp:
+                    type: string
+                    format: date-time
+                    description: Fecha y hora de la compensación
+      required:
+        - transactionId
+        - status
+        - processedAt
+        - region
+
+    AccountBalanceResponse:
+      type: object
+      description: |
+        Respuesta de la consulta de saldo de una cuenta.
+        **Preguntas para completar el esquema:**
+        1. ¿Cómo representarías el saldo en múltiples monedas si la cuenta es multidivisa?
+        2. ¿Qué información adicional incluirías para indicar la frescura de los datos (ej: timestamp de la última actualización)?
+        3. ¿Cómo manejarías los saldos bloqueados o reservados en transacciones pendientes?
+        4. ¿Qué metadatos incluirías para soportar auditoría y trazabilidad?
+      properties:
+        accountId:
+          type: string
+          format: uuid
+          description: Identificador único de la cuenta
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        balance:
+          type: number
+          format: double
+          description: Saldo disponible de la cuenta
+          example: 1500.75
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: Código ISO de la moneda
+          example: "USD"
+        lastUpdated:
+          type: string
+          format: date-time
+          description: Fecha y hora de la última actualización del saldo
+        region:
+          type: string
+          enum: ["us-east-1", "eu-west-1", "ap-southeast-1", "sa-east-1"]
+          description: Región donde se consultó el saldo
+      required:
+        - accountId
+        - balance
+        - currency
+        - lastUpdated
+        - region

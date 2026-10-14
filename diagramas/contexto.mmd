@@ -1,0 +1,33 @@
+C4Context
+    title Contexto del Core Financiero Multi-Región
+
+    Enterprise_Boundary(b0, "Institución Financiera Global") {
+        Person(customer, "Cliente", "Cliente final que realiza transacciones financieras", "$descriptor=retail,corporativo")
+        Person(operations, "Equipo de Operaciones", "Equipo responsable de monitorear y mantener el sistema", "$descriptor=24/7")
+
+        SystemDb_Ext(legacyCore, "Core Financiero Legacy", "Sistema monolítico existente que procesa transacciones financieras", "$tags=legacy")
+        System_Ext(audit, "Sistema de Auditoría", "Sistema externo responsable de registrar todas las operaciones para cumplimiento regulatorio", "$tags=regulatorio")
+        System_Ext(fraudDetection, "Servicio de Detección de Fraude", "Servicio externo que analiza transacciones en tiempo real para detectar actividades sospechosas", "$tags=seguridad")
+        System_Ext(swift, "Red SWIFT", "Red global para transferencias interbancarias", "$tags=interbancario")
+    }
+
+    System_Boundary(multiRegionCore, "Core Financiero Multi-Región (Sistema Objetivo)") {
+        SystemDb(coreService, "Core Financiero Multi-Región", "Nuevo sistema distribuido que procesa transacciones financieras con alta disponibilidad y resiliencia multi-región", "$tags=active-active")
+    }
+
+    Rel(customer, coreService, "Realiza transacciones financieras", "HTTPS")
+    Rel(operations, coreService, "Monitorea y opera el sistema", "HTTPS")
+    Rel(coreService, audit, "Envía registros de operaciones", "gRPC")
+    Rel(coreService, fraudDetection, "Consulta análisis de fraude", "gRPC")
+    Rel(coreService, swift, "Envía transferencias interbancarias", "SWIFT FIN")
+    Rel(coreService, legacyCore, "Sincronización de datos (fase de migración)", "SFTP")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+
+    %% Preguntas guía para completar el diseño multi-region:
+    %% 1. ¿Qué actores adicionales deberían incluirse en el contexto para soportar operaciones multi-región?
+    %% 2. ¿Cómo se comunican las regiones entre sí para mantener consistencia eventual? ¿Qué protocolos y mecanismos usarías?
+    %% 3. ¿Qué sistemas externos requieren integración regionalizada (ej: réplicas locales de SWIFT o servicios de fraude)?
+    %% 4. ¿Cómo impacta la latencia inter-región en los contratos de servicio con los clientes? ¿Qué umbrales establecerías para garantizar la experiencia del usuario?
+    %% 5. ¿Qué métricas clave (ej: RPO, RTO) debe cumplir el sistema para ser considerado resiliente? ¿Cómo las medirías y monitorearías?
+    %% 6. ¿Qué patrones arquitectónicos (ej: Multi-Region Active-Active, CQRS, Sagas) aplicarías para garantizar la disponibilidad y consistencia de datos?
